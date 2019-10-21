@@ -1,0 +1,398 @@
+---
+title: "Titanic_predictions"
+author: '201812413'
+date: '6 октября 2019 г '
+output: html_document
+---
+
+### Learning the fundametals of Data Science research design with Titanic dataset
+
+# Introduction
+
+This excercise was created to demonstrate the step-by-step approach to building and analyzing statistical learning models in R. The dataset used in this exercise can be found on kaggle (https://www.kaggle.com/c/titanic/data). 
+
+This exercise is for the beginners in Data science, it is desirable (but not compulsory!) to be familiar with logistic regression before starting this exercise, and have some previous experience in basic statistics / data analysis. 
+
+## Descripion
+
+#1. Let's start!
+
+Before you start, make sure you have uploaded all the following libraries we will need today:
+
+```{r}
+require(dplyr)
+require(readr)
+require(glmnet)
+require(caret)
+require(ggplot2)
+
+
+require(tidyverse)
+require(naivebayes)
+```
+
+
+Let's read the dataset and see its description:
+
+```{r}
+titanic <- read.csv2("train.csv", sep = ',', stringsAsFactors = F)
+```
+R readr function read_csv helpfully tells us what type of data is encoded in each column: `double` is equivalent to Python's `float`, and `character` is analogous to a `string` type - numerical and textual data, respectively. 
+
+Let's look at the dataset description to see if we need to adjust any data types. It is critical to make sure none of the categorical variables are encoded as contunuous and vice versa. 
+
+```{r}
+head(titanic)
+```
+Fro the dataset description on kaggle we see that certain variables need to be re-encoded. the variable we will aim to predict, `Survived`, is encoded as 0/1 for yes/no. It is a good practice to turn it and other analogous variables into factors, or ordinal/nominal variables, especially if they are encoded as numeric by default. 
+
+On this stage of data exploration, we have to pose a research question. Although without knowing the variables yet, it should be as generic as possible. Something like "how can we predict who survives and who dies on Titanic using the data available in this dataset?"
+
+```{r}
+titanic$Survived <- as.factor(titanic$Survived)
+levels(titanic$Survived) <- c("no", "yes")
+```
+
+We can treat class either as ordinal or as categorical variable. As there are only three classes, let's approach it as a categorical variable, because the number of categories is not large enough. The dataset description argues that it is a good proxy for the SES (socio-economic class). Sex gets the same treatment. Having age and gender varibles in our dataset, we can test if the old saying "women and children first" was true during the catastrophe. 
+
+```{r}
+titanic$Pclass <- as.factor(titanic$Pclass)
+titanic$Sex <- as.factor(titanic$Sex)
+titanic$Embarked <- as.factor(titanic$Embarked)
+titanic$Age <- as.double(titanic$Age)
+titanic$Fare <- as.double(titanic$Fare)
+
+```
+
+
+#3. Wrangling features: missing values and feature engineering, pre-processing
+
+Deciding which features (or their combinations) to use, how to deal with missing values and how to process existing features is one of the most important steps in a data science project. A lot of different ML approaches can give you comparable prediction strength in the same datasets, but changing the way you approach your features can drastically improve your results. 
+
+First of all, let us drop features we can reasonably assume are not relevant. In this dataset, names, cabin and ticket numbers are of less interest to us. If we worked on this prediction problem in commercial capacity, we might have tried to play around these variables, maybe extracting a letter standing for the cabin number, or trying to extract titles from the names (see https://triangleinequality.wordpress.com/2013/09/08/basic-feature-engineering-with-the-titanic-data/ for Python guide on it). 
+
+```{r}
+titanic[, c("Name", "Ticket", "Cabin")]  <- NULL
+```
+
+Missing values (like N/A, None, etc) can be relatively minor concern for some tree-based algorthms, but will give you trouble in regression-based algorithms. Let's see if they are present in our dataset:
+
+```{r}
+sapply(titanic, function(x) sum(is.na(x)))
+sapply(titanic, function(x) sum(x == ""))
+```
+
+Seeint that many columns do not have missing values at all, let us start with basic feature engieering. There are two columns in the dataset, SibSp and Parch: number of siblings/spouses and parents/children the person was travelling with. It makes sense just to unite them in one column, designated to count total number of family members:
+
+```{r}
+titanic$Family <- titanic$SibSp + titanic$Parch #many R operators are vectorised: ie they understand you want to add together paired elements in a vector without iterating over them
+
+#then we can delete old columns, because they might interact with the new variable in a shady way (we have to avoid linear dependency whenever possible, as it introduces multiple solutions to our regression coefficients)
+
+titanic$SibSp <- NULL
+titanic$Parch <- NULL
+```
+
+We are relatively lucky to see the missing values present only in 2 columns, and in one of them (port of departure) - in negligible quantity. Let's impute those two missing values with the most popular option, which is "S", standing for Southampton. 
+
+```{r}
+table(titanic$Embarked)
+titanic$Embarked[which(titanic$Embarked == "")] <- "S"
+titanic$Embarked <- as.factor(titanic$Embarked)
+```
+There are many complex imputation algorithms out there, however in commercial landscape sometimes it does not make sense to spend research resources on it. In a dataset with multiple thousands entries one would rather just delete the rows with missing values if there are less than a hundred of them. The decision to impute or delete depends on how important we think the variable is for prediction, how many other variables might be missing from the rows affected and how imputation would change the relationships between variables. 
+
+It is a completely different case if rows with missing values constitute a sizeable chunk of all rows. In case of Age column, it is even more problematic because we expect age to be an important predictor. Therefore, it makes sense to impute. 
+
+Imputation can be roughly divided by three main types:
+
+- Imputation using mean/median values: depending on the distribution of the variable, either can be a good option. We can add the mode imputation for categorical variables we already used to these two. It is simple, but can be seen as too mechanic. It "dulls" the data, making it more difficult to detect some fine patterns if the major predictor variable has been significantly affected by imputation. It is good for cases when there are many significant predictor variables and when not too many values are affected.
+
+The code for mean/median imputation would be something like `titanic$Age[which(is.na(titanic$Age))] <- mean(titanic$Age)`, or `titanic$Age[which(is.na(titanic$Age))] <- median(titanic$Age)`. 
+
+
+- Regression-based imputation: there, we basically create a "mini-model" using the rows with no NA as training set and rows with NA as testing set. Then, we aim to predict missing values based on the other predictor variables. Even if there is no connection between them, this model basically defaults to the mean imputation. It is not as quick as mean imputation, but can be much faster than more advanced methods. It is also more precise, taking correlations between variables into account. 
+
+Let us create a version of the dataset where age imputed with regression. For this one, we will simply use an in-built regression function to demonstrate R regression syntax. 
+
+```{r}
+impute_train <- titanic[which(titanic$Age != ""), c(3:8)]
+impute_regmodel <- lm(Age~., data = impute_train)
+summary(impute_regmodel)
+```
+A few significant strong coefficients show us that we can improve the imputation quality by fitting the regression values. 
+
+```{r}
+impute_test <- titanic[which(is.na(titanic$Age)), c(3, 4, 6, 7, 8)]
+impute_regmodel_ages <- round(predict(impute_regmodel, impute_test), digits = 2)
+
+titanic$Age[which(is.na(titanic$Age))] <- impute_regmodel_ages
+```
+
+
+- Machine learning based methods, like k-NN imputation. It is an imputation method based on clustering approach (finding similar groups of cases). First, it uses mean imputation to complete the dataset. Then, it finds k (any number, from one to n) Nearest Neighbours of the data point we need to impute. After that, it recalculates the value based on the average/weighed average of the values in these k points. If we set k to one, the algorithm would just select the most similar data point and take its value. For example, if we miss the the age of a single 3rd class male passenger who paid 10 pounds for a ticket and embarked in Queensport, the system would just select a person with the closest characteristics and take his age as input. If we set k to 2, it would compute a average of two most similar guys, that can be weighted by the degree of similarity. It can produce very accurate imputations, but it is very computationally demanding: it is basically like running a whole other machine learning model just to prepare to your main task!
+
+Due to the time constraints, I will leave k-NN imputation as a "homework" assignment, only suggesting the following libraries/functions:
+
+knn.impute
+From bnstruct v1.0.6
+by Alberto Franzin
+
+impute.knn
+From impute v1.46.0
+by Balasubramanian Narasimhan
+
+after loading the packages, you can always use R helper by printing `?function.name` in the Console to look into arguments and examples. 
+
+Or if you feel like doing extra, you can try running caret preProcess function. It works like a model, so to show pre-processed data you would want first to `preProcess` your data with `method` set to `knnImpute`, and then run a `predict` like we did with linear regression. preProcessing also scales and centers your data. 
+
+Centering your data is a good practice when you need to interpret the intercept. It simply substracts the same value from all x, so one of them becomes 0. In the regression model trained on such data, the intercept is a mean value of y on the minimal value of x. It is especially critical when range of your predictors is not close to 0, or when you use polynomial regression. 
+
+Scaling your variables is important when you need to directly compare the coefficients, which is not always possible when the variables are on different scales (as the small "span" of a variable inflates its significance and vice versa). When working with variables like income, linear coefficients can be tiny, as they correspond to the growth of 1 unit (one dollar). Scaling helps to see "strength" of factors in context. 
+
+If you are interested in more advanced topics, I would suggest looking up pre-Processing section in caret guide (honestly, the whole file is well worth the read): http://topepo.github.io/caret/index.html. You would learn how to deal with:
+
+-near-Zero variance: a situation where some (usually categorical) variables are mvery unequally distributd, which causes issues with crossvalidation and train/test split. Research into near-Zero variancne can lead you into the fascinating universe of unbalanced classification and anomaly detection. 
+
+- linear dependencies and correlated predictors. Although some methods are ok with the variables being in any correlation between each other, it can penalize your regression-based models. 
+
+
+#3. Visualization and descriptive statistics
+
+After we decided on the number and shape of our variables, let us embark on the tour around our data. 
+
+```{r}
+summary(titanic)
+```
+Similar to `describe` in python, R's `summary` presents you with an overview of nearly any possible object you have, from models to dataframes. 
+
+
+Most of our descriptives are self-explanatory. Let's start visualizaton with single continuous variable distributions: age and fare 
+
+```{r}
+ggplot(titanic, aes(x=Age)) + geom_density()
+ggplot(titanic, aes(x=Fare)) + geom_density()
+```
+
+We can see that age disribution is relatively normal, whereas Fare reminds more of a log-normal distribution. To avoid heteroscedasticity and "even out" our data, we can log-transform the variables. We expect the log-transformed variables to assume more normal distribution, satisfying assumptions of the regression methods. 
+
+```{r}
+ggplot(titanic, aes(x=log(Fare))) + geom_density()
+```
+
+We have to be mindful of zero values, as it is impossible to get a logarithm of 0. We can just live them as they are - there is a negligble difference between paying 1 dollar and paying 0 dollars for a ticket. Note that not everywhere that would be the case!
+
+```{r}
+titanic$Fare <- lapply(titanic$Fare, function(x) ifelse(x == 0, x, log(x))) %>% as.double()
+colnames(titanic)[6] <- "logFare" #always keep an eye on transformations and change column names to reflect it!
+```
+
+Let's continue to visualize the relationship between variables of interest and dependent variable - starting from categorical variables. To plot the relationships between categorical value frequencies, we are going to use bar charts. Although ggplot can conjure complex plots from a standard dataframe, we are going to use dplyr mutation and aggregation functions to better map the data to the plot. 
+
+```{r}
+titanic_cat <- titanic %>%
+  select(Survived, Sex, Pclass) %>%
+  count(Survived, Sex, Pclass) %>%
+  mutate(prop = prop.table(n)) %>%
+unite(SurvivedSex, c(Survived, Sex), sep = " ", remove = FALSE)
+```
+```{r}
+as.data.frame(titanic_cat)
+```
+ 
+```{r}
+ggplot(titanic_cat, aes(x = SurvivedSex, y = n)) + 
+    geom_histogram(position="stack", stat="identity", width = 0.5, aes(fill = Pclass)) + 
+   
+    ggtitle("Gender, Class and Survival") +
+    labs(fill = "Class")
+
+```
+
+Descriptive statistics and visualizations clearly show that class and gender strongly affect chances of survival. Let us pull the numbers to be certain. We will perform a chi-square test against both variables to see if the inequialities we saw are statistically significant.
+
+```{r}
+chisq.test(table(titanic$Survived, titanic$Pclass))
+```
+
+```{r}
+chisq.test(table(titanic$Survived, titanic$Sex))
+```
+
+As we see, both results are statistically siginficant and X-squared values signify that belonging to the different gender and SES groupas affected one's chance of survival.
+```{r}
+chisq.test(table(titanic$Survived, titanic$Embarked))
+```
+It is curious to see that the port of departure also affects chances of survival. Let us visualize this relationship:
+```{r}
+ggplot(titanic, aes(x = Survived, y = 1)) + 
+    geom_histogram(position="stack", stat="identity", width = 0.5, aes(fill = Embarked)) + 
+    ggtitle("Departure and Survival")
+```
+```{r}
+table(titanic$Pclass, titanic$Embarked)
+```
+
+Next on our data journey - continuous variables logFare, Family and Age. They call for different visualization and statistical inference methods when evaluated against continuous variable "Survived".
+
+Fist of all, let us check the main differences in them:
+
+```{r}
+titanic_cont <- titanic %>% 
+  select(Survived, Family, logFare, Age) %>% 
+  group_by(Survived) %>% 
+  summarize_each(funs(mean, sd, median))
+
+titanic_cont
+```
+
+From the first glance, continuous variables do not have the same stark differences between them as categorical variables. One way to investigate thm further is to employ violin plots, as they show not only differences between categories, but also underlying data distributions :
+
+```{r}
+ggplot(titanic, aes(x=Survived, y=Family)) + 
+  geom_violin()
+```
+The results here support out prior data that for survivors, both median and mean number of family members on board was higher.
+
+One thing to note here is to note that this variable does not really belong to the continuous family, seeing as the vast majority of values are set on 0, 1 or 2. It would make sense to recode the variable to categorical: 
+
+```{r}
+titanic$Family <- lapply(titanic$Family, function(x) ifelse(x == 0, "no", "yes")) %>% as.character
+titanic$Family <- as.factor(titanic$Family)
+```
+
+
+
+```{r}
+ggplot(titanic, aes(x=Survived, y=Age)) + 
+  geom_violin()
+```
+
+This violin(or rather, manta ray) plot shows that children between ages 0 and 10, as well as older people are overrepresented in the surviving population. 
+
+```{r}
+ggplot(titanic, aes(x=Survived, y=logFare)) + 
+  geom_violin()
+```
+
+logFare, unsurprisingly, shows the increased the chances of survival for those who paid more for a ticket, which strongly corresponds with SES / class:
+
+```{r}
+titanic %>% 
+  select(Pclass,logFare) %>% 
+  group_by(Pclass) %>% 
+  summarize_each(funs(mean, sd, median))
+```
+This introduces a multicollinearity problem into any regression methods we will implement. So, our regression models would have to choose either Fare or Pclass as a stand-in for SES. 
+
+#4. Regression analysis
+
+After we analyzed the variables, it is time to move to the first step of the predictive excercise: logistic regression. 
+
+We have two variables that can stand for SES: logFare and Pclass. Let us fit two different models and see which one would predict the test dataset better. 
+
+```{r}
+model_pclass <- glm(Survived ~ Age + Sex + Pclass + Family + Embarked, data = titanic, family = "binomial")
+summary(model_pclass)
+```
+```{r}
+model_logfare <- glm(Survived ~ Age + Sex + logFare + Family + Embarked, data = titanic, family = "binomial")
+summary(model_logfare)
+```
+
+
+```{r}
+model_pclass1 <- glm(Survived ~ Age + Sex + Pclass + Family + Embarked + Sex*Pclass, data = titanic, family = "binomial")
+summary(model_pclass1)
+```
+We can see that the pclass1 model with interaction between sex and class provides an improved fit (lower residual variance) than the other models. 
+
+
+Let us run a different type of model. Naive Bayes classifier operates under a strong assumption of conditional independence, so we would have to choose again, if we want to see Pclass or log fare among our predictors. 
+
+You can read more about Naive Bayes here:
+
+https://towardsdatascience.com/naive-bayes-classifier-81d512f50a7c
+
+We can only add that implementing it in caret. Caret is one of the best R libraries for Machine Learning because it allows to tune the model as it runs. 
+
+As machine leraning algorithms are typically more complex than a simple regression model, they require additional tuning parameters, that can be selected arbitrarily (I can only recommend that if you have a very good statistical understanding of these parameters and your data). More often though, data model runs through several possible options in a range of parameters and selects the best possible value. 
+
+We have to perform another excercise, splitting our dataset to test and train:
+
+```{r}
+titanic <- titanic[sample(nrow(titanic)), ]
+titanic_train <- titanic[c(1:791), ]
+titanic_test <- titanic[c(792:891), ]
+```
+
+Cross-vadidation folds (cv parameter) in caret naive bayes implementation regulates the validation process in the algorithm. The model essentially runs its own mini train-and-test processes to evaluate its performance and adjust some internal variables. cv tells the model how many different cross-validation splits you wat to have in your data. The standard convention is 5-10, however seeing as our dataset is not that large, let's try 3:
+
+NB is a very simple, fast and scalable system: it does not have many tuning parameters. In fact, we will only tune Laplace correction, a system used to smooth categorical data:
+
+```{r}
+set.seed(33)
+TC <- trainControl(method="repeatedcv", number=3, repeats=3)
+tune <- expand.grid(laplace = c(0, 0.5, 1), usekernel = F, adjust = 0)
+```
+```{r}
+model_nb <- train(Survived~Age + Sex + Pclass + Family + Embarked, 
+                  data = titanic_train,
+                  method = "naive_bayes", 
+                  tuneGrid = tune,
+                  trControl = TC
+                  
+  
+)
+model_nb
+```
+```{r}
+varImp(model_nb)
+```
+Another type of the models is represented by decision trees. It is a slower algorithm, built on completely different statistical processes. It holds less assumptions about data, while allowing extensive tuning. Decision trees and its envolved ensemble cousins Random Forests can be used for text data, data with a large number of variables, as well as the imbalanced datasets. 
+
+Our dataset is mildly imbalanced, but not enough to warrant using the weighting methods. 
+
+```{r}
+set.seed(33)
+tunetree <- expand.grid(iter = c(5, 10, 15, 20), maxdepth = c(3, 5, 10), nu = c(0.1, 0.2, 0.3, 0.4, 0.5))
+model_tree <- train(Survived~Age + Sex + Pclass + Family + Embarked  + logFare, 
+                  data = titanic_train,
+                  method = "ada", 
+                  tuneGrid = tunetree,
+                  trControl = TC, 
+                  metric = "Kappa"
+)
+model_tree
+```
+```{r}
+set.seed(33)
+tunetree <- expand.grid(iter = 20, maxdepth = 10, nu = 0.1)
+model_tree <- train(Survived~Age + Sex + Pclass + Family + Embarked  + logFare, 
+                  data = titanic_train,
+                  method = "ada", 
+                  tuneGrid = tunetree,
+                  trControl = TC,
+                  metric = "Kappa"
+)
+```
+```{r}
+model_tree
+```
+```{r}
+varImp(model_tree)
+```
+As data scientists, we are interested in comparing models on the basis of the results. Sometimes, we would be interested in algorithmic (time- and cost-eficiency) or statistical (parsimony) comparison as well.  
+
+To see which algorithm performed better, let's fit the model to the testing data:
+
+```{r}
+pred_nb <- predict(model_nb, titanic_test[, c(3:8)])
+conf_nb = caret::confusionMatrix(pred_nb, titanic_test$Survived)
+conf_nb
+```
+```{r}
+pred_tree <- predict(model_tree, titanic_test[, c(3:8)])
+conf_tree = caret::confusionMatrix(pred_tree, titanic_test$Survived)
+conf_tree
+```
